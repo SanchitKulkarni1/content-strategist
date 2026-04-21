@@ -1,6 +1,6 @@
 """Pydantic schemas for structured LLM outputs.
 
-Used by both Gemini (response_schema) and Cerebras (json_schema)
+Used by both Anthropic Claude (prompt-based schema) and GPT-OSS-12B (json_schema)
 to enforce consistent, parseable responses from the LLM council.
 """
 from __future__ import annotations
@@ -98,4 +98,17 @@ class PostPrompt(BaseModel):
 class PostPromptList(BaseModel):
     posts: list[PostPrompt] = Field(
         description="List of 5 Instagram post prompts."
+    )
+
+
+# ─────────────────────────────────────────────
+# MASTER REPORT SCHEMA (Phase 2 Opus Synthesis)
+# ─────────────────────────────────────────────
+
+class MasterReport(BaseModel):
+    gap_analysis: GapAnalysis
+    post_prompts: PostPromptList
+    strategy_report: str
+    councilor_notes: str = Field(
+        description="Opus's meta-commentary on where models disagreed and how the final strategy was synthesized."
     )

@@ -103,11 +103,13 @@ else:
     report = recs.get("strategy_report", "")
     gap_analysis = recs.get("gap_analysis", {})
     prompts = recs.get("post_prompts", {}).get("posts", [])
+    councilor_notes = recs.get("councilor_notes", "")
     
-    tab_report, tab_gaps, tab_posts = st.tabs([
+    tab_report, tab_gaps, tab_posts, tab_notes = st.tabs([
         "📄 Strategic Report", 
         "🔍 Gap Analysis", 
-        "📸 Post Prompts"
+        "📸 Post Prompts",
+        "🧠 Councilor Notes"
     ])
     
     # --- TAB 1: STRATEGIC REPORT ---
@@ -196,3 +198,8 @@ else:
                 st.markdown(f"**Hashtags:** `{'` `'.join(post.get('hashtags', []))}`")
                 st.divider()
 
+    # --- TAB 4: COUNCILOR NOTES ---
+    with tab_notes:
+        st.markdown("### Opus Council Meta-Commentary")
+        st.info("This section shows Claude Opus's internal thought process as the council chairman, explaining how it resolved disagreements between GPT-OSS and Claude Sonnet.")
+        st.markdown(councilor_notes)

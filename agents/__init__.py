@@ -108,17 +108,17 @@ def scrape_instagram_data_node(state: dict[str, Any]) -> dict[str, Any]:
 # ─────────────────────────────────────────────
 
 def fetch_market_trends_node(state: dict[str, Any]) -> dict[str, Any]:
-    """Generate search queries (Gemini) → execute SERP (parallel) → Google Trends.
+    """Generate search queries (Claude Haiku) → execute SERP (parallel) → Google Trends.
     
     This is the merged search intelligence + market trends node.
-    Gemini infers the niche from the Apify data to generate
+    Claude Haiku infers the niche from the Apify data to generate
     targeted search queries.
     """
     from agents.searchcalls import get_market_trends
 
     intelligence = state["apify_brand_intelligence"]
 
-    logger.info("Fetching market trends (Gemini → SERP → Google Trends)...")
+    logger.info("Fetching market trends (Claude Haiku → SERP → Google Trends)...")
 
     try:
         trends = get_market_trends(intelligence)
@@ -141,9 +141,9 @@ def fetch_market_trends_node(state: dict[str, Any]) -> dict[str, Any]:
 
 def run_analysis_node(state: dict[str, Any]) -> dict[str, Any]:
     """Run the 3-layer LLM analysis pipeline:
-    Layer 1 → Gap Analysis        (Council: Cerebras + Gemini → Gemini chairman)
+    Layer 1 → Gap Analysis        (Council: GPT-OSS-12B + Claude Sonnet → Claude Opus chairman)
     Layer 2 → Post Prompts        (Council)
-    Layer 3 → Strategy Report     (Cerebras)
+    Layer 3 → Strategy Report     (GPT-OSS-12B)
     """
     from agents.analyzer import run_analysis
 

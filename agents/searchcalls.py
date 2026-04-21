@@ -1,4 +1,4 @@
-"""Market trend intelligence — Gemini thinking + SERP API + Google Trends.
+"""Market trend intelligence — Claude Haiku thinking + SERP API + Google Trends.
 
 Generates strategic search queries from scraped Instagram data,
 executes them via SERP API (in parallel), and packages trend signals.
@@ -14,9 +14,8 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
+import anthropic
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 
 from tools.serp import organic_search, trends_timeseries
 
@@ -25,8 +24,11 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Fast, cheap — generates strategic SERP search queries
+QUERY_AGENT = "claude-haiku-4-5-20251001"
 
 GENERIC_TAGS = {"fyp", "explore", "trending", "viral", "reels", "instagram"}
 
@@ -72,11 +74,11 @@ Pinned Post  : {pinned.get('caption', 'N/A')[:120] if pinned else 'None'}
 
 
 # ─────────────────────────────────────────────
-# GEMINI THINKING LAYER
+# CLAUDE HAIKU THINKING LAYER
 # ─────────────────────────────────────────────
 
 def _generate_search_queries(intelligence: dict) -> list[str]:
-    """Use Gemini to generate strategic, niche-aware search queries
+    """Use Claude Haiku to generate strategic, niche-aware search queries
     based entirely on the scraped Instagram data.
     
     The LLM infers the niche, audience, and market from the data.
@@ -85,9 +87,9 @@ def _generate_search_queries(intelligence: dict) -> list[str]:
     brand_username = _get_brand_username(intelligence)
     current_date = datetime.now().strftime("%B %Y")
 
-    prompt = f"""You are a social media strategist analyzing Instagram data.
+    system = "You are a social media strategist analyzing Instagram data. You MUST respond with ONLY a valid JSON array of exactly 5 query strings. No explanation, no markdown, no code fences — just the JSON array."
 
-Here is the competitive intelligence data:
+    user = f"""Here is the competitive intelligence data:
 {summary}
 
 Your task:
@@ -107,24 +109,31 @@ Rules:
 - Return ONLY a valid JSON array of 5 query strings, nothing else
 """
 
-    logger.info("Gemini thinking: generating strategic search queries...")
-    response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.7,
-            response_mime_type="application/json",
-        ),
+    logger.info("Claude Haiku thinking: generating strategic search queries...")
+    response = anthropic_client.messages.create(
+        model=QUERY_AGENT,
+        max_tokens=1024,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+        temperature=0.7,
     )
 
-    raw_text = (response.text or "").strip()
-    queries = json.loads(raw_text)
+    import re
+    raw_text = (response.content[0].text or "").strip()
+    logger.info(f"Claude raw response: {raw_text[:200]}")
+    # Strip markdown code fences if Claude wrapped the JSON
+    cleaned = re.sub(r"```json\s*|```\s*", "", raw_text).strip()
+    # Try to extract JSON array if there's preamble text
+    match = re.search(r"\[", cleaned)
+    if match:
+        cleaned = cleaned[match.start():]
+    queries = json.loads(cleaned)
     if not isinstance(queries, list):
-        raise ValueError("Gemini response is not a JSON array of queries")
+        raise ValueError("Claude response is not a JSON array of queries")
     queries = [str(q).strip() for q in queries if str(q).strip()][:5]
     if len(queries) < 3:
-        raise ValueError("Gemini returned too few usable search queries")
-    logger.info(f"Gemini generated {len(queries)} queries:")
+        raise ValueError("Claude returned too few usable search queries")
+    logger.info(f"Claude Haiku generated {len(queries)} queries:")
     for i, q in enumerate(queries, 1):
         logger.info(f"  {i}. {q}")
 
@@ -163,13 +172,13 @@ def _execute_serp_queries(queries: list[str], num_results: int = 5) -> dict:
 
 def get_market_trends(intelligence: dict) -> dict:
     """Full market trend pipeline:
-    1. Gemini infers niche + generates search queries
+    1. Claude Haiku infers niche + generates search queries
     2. SERP API executes queries (in parallel)
     3. Google Trends for top meaningful hashtag
     4. Package everything
     """
 
-    # Step 1: Gemini decides what to search
+    # Step 1: Claude Haiku decides what to search
     queries = _generate_search_queries(intelligence)
 
     # Step 2: Execute SERP queries in parallel
@@ -202,7 +211,7 @@ def get_market_trends(intelligence: dict) -> dict:
 
     # Step 4: Package everything
     trends = {
-        "gemini_queries":           queries,
+        "search_queries":           queries,
         "serp_results":             serp_results,
         "google_trends_timeseries": google_trends_data,
         "_meta": {

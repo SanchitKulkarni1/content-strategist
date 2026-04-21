@@ -1,32 +1,37 @@
-"""Analysis pipeline with LLM Council (GPT-OSS-12B + Gemini).
+"""Analysis pipeline with LLM Council (GPT-OSS-12B + Claude Sonnet → Claude Opus).
 
-Layer 1: Gap Analysis          — Council (parallel GPT-OSS-12B + Gemini → Gemini chairman)
-Layer 2: Post Prompts          — Council
-Layer 3: Strategy Report       — Single GPT-OSS-12B call
+Phase 1 — ALL THREE LAYERS run fully in parallel:
+  L1: Gap Analysis      — GPT + Sonnet in parallel (no internal merge)
+  L2: Post Prompts      — GPT + Sonnet in parallel (no internal merge)
+  L3: Strategy Report   — GPT + Sonnet in parallel (no internal merge)
 
-All prompts are NICHE-AGNOSTIC: the LLM infers the domain, audience,
-and tone entirely from the scraped Apify + SERP data.
+Phase 2 — Single Opus call:
+  Receives all 6 raw outputs, synthesizes ONE master report with
+  validated gap analysis, post prompts, and strategic brief.
+
+Total LLM calls : 6 in parallel → 1 Opus call = 2 phases
+Target wall time : < 2 minutes
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
+import anthropic
 from openai import OpenAI
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 from pydantic import BaseModel, ValidationError
 
-from agents.schemas import GapAnalysis, PostPromptList
+from agents.schemas import GapAnalysis, PostPromptList, MasterReport
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
 
 # ─────────────────────────────────────────────
 # CLIENTS
@@ -34,19 +39,21 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 gpt_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
-    base_url="https://openrouter.ai/api/v1"
+    base_url="https://openrouter.ai/api/v1",
 )
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-GPT_MODEL = "openai/gpt-oss-120b:free"
-GEMINI_MODEL = "gemini-flash-latest"
+GPT_MODEL      = "openai/gpt-oss-120b:free"
+ANALYSIS_AGENT = "claude-sonnet-4-6"   # Phase 1 worker — all 6 parallel calls
+COUNCILOR      = "claude-opus-4-7"     # Phase 2 chairman — single synthesis call
+
 
 # ─────────────────────────────────────────────
 # BASE LLM CALLERS
 # ─────────────────────────────────────────────
 
 def _gpt(system: str, user: str, temperature: float = 0.7) -> str:
-    """GPT-OSS-12B call — fast, data-driven. Returns JSON string."""
+    """GPT-OSS call — JSON mode."""
     response = gpt_client.chat.completions.create(
         model=GPT_MODEL,
         messages=[
@@ -60,7 +67,7 @@ def _gpt(system: str, user: str, temperature: float = 0.7) -> str:
 
 
 def _gpt_text(system: str, user: str, temperature: float = 0.7) -> str:
-    """GPT-OSS-12B call — plain text response (no JSON mode)."""
+    """GPT-OSS call — plain text."""
     response = gpt_client.chat.completions.create(
         model=GPT_MODEL,
         messages=[
@@ -72,58 +79,38 @@ def _gpt_text(system: str, user: str, temperature: float = 0.7) -> str:
     return response.choices[0].message.content.strip()
 
 
-def _gemini(system: str, user: str, temperature: float = 0.7) -> str:
-    """Gemini call — nuanced, creative. Uses system_instruction for proper role separation."""
-    response = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=user,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            temperature=temperature,
-            response_mime_type="application/json",
-        ),
-    )
-    return response.text.strip()
+def _sonnet(system: str, user: str, temperature: float = 0.7) -> str:
+    """Claude Sonnet call — JSON mode via prompt instruction."""
+    return anthropic_client.messages.create(
+        model=ANALYSIS_AGENT,
+        max_tokens=8192,
+        temperature=temperature,
+        system=system + "\n\nRespond with ONLY valid JSON. No explanation, no markdown fences.",
+        messages=[{"role": "user", "content": user}],
+    ).content[0].text.strip()
 
 
-def _gemini_structured(
-    system: str,
-    user: str,
-    schema: type[BaseModel],
-    temperature: float = 0.7,
-) -> str:
-    """Gemini call with Pydantic schema enforcement."""
-    response = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=user,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            temperature=temperature,
-            response_mime_type="application/json",
-            response_schema=schema,
-        ),
-    )
-    return response.text.strip()
+def _sonnet_text(system: str, user: str, temperature: float = 0.7) -> str:
+    """Claude Sonnet call — plain text."""
+    return anthropic_client.messages.create(
+        model=ANALYSIS_AGENT,
+        max_tokens=8192,
+        temperature=temperature,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+    ).content[0].text.strip()
 
 
 def _parse_and_validate(raw: str, schema: type[BaseModel], retries: int = 2) -> BaseModel:
-    """Parse raw JSON text and validate against a Pydantic schema.
-    
-    Retries by stripping markdown fences and common LLM artifacts.
-    """
+    """Parse raw JSON and validate against a Pydantic schema with retry."""
     import re
-
     for attempt in range(retries + 1):
         try:
-            # Strip markdown code fences if present
             cleaned = re.sub(r"```json\s*|```\s*", "", raw).strip()
             return schema.model_validate_json(cleaned)
         except (ValidationError, json.JSONDecodeError) as exc:
             if attempt < retries:
-                logger.warning(
-                    f"  Parse attempt {attempt + 1} failed: {exc}. Retrying..."
-                )
-                # Try extracting first JSON object/array from the text
+                logger.warning(f"  Parse attempt {attempt + 1} failed: {exc}. Retrying...")
                 match = re.search(r"[\[{]", cleaned)
                 if match:
                     raw = cleaned[match.start():]
@@ -133,94 +120,28 @@ def _parse_and_validate(raw: str, schema: type[BaseModel], retries: int = 2) -> 
 
 
 # ─────────────────────────────────────────────
-# LLM COUNCIL
-# ─────────────────────────────────────────────
-
-def _council(
-    system: str,
-    user: str,
-    schema: type[BaseModel] | None = None,
-    temperature: float = 0.7,
-) -> str:
-    """LLM Council Pattern:
-    1. GPT-OSS-12B + Gemini respond to the same prompt in PARALLEL
-    2. Gemini acts as Chairman to synthesize the best merged response
-    """
-    logger.info("  [Council] Firing GPT-OSS-12B + Gemini in parallel...")
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future_gpt    = executor.submit(_gpt, system, user, temperature)
-        future_gemini = executor.submit(_gemini, system, user, temperature)
-        response_a = future_gpt.result()
-        response_b = future_gemini.result()
-
-    logger.info("  [Council] Both responses received. Gemini chairman merging...")
-
-    merge_system = (
-        "You are the Chairman of an expert LLM Council. "
-        "Two AI analysts have independently analyzed the same data. "
-        "Synthesize ONE final response taking the SHARPEST, most SPECIFIC, "
-        "most ACTIONABLE insights from both."
-    )
-
-    merge_user = f"""Two expert AI models analyzed the same data independently.
-Your job: synthesize ONE final response.
-
-Rules:
-- Pick the BEST, most data-backed insight from each — do NOT average weakly
-- If both agree → include with higher confidence
-- If they disagree → pick the more specific, evidence-backed one
-- Keep EXACTLY the same JSON structure as the inputs
-- Return ONLY valid JSON, no explanation
-
-=== RESPONSE A (GPT-OSS-12B — data-driven) ===
-{response_a}
-
-=== RESPONSE B (Gemini — creative/nuanced) ===
-{response_b}
-
-Merged final response:"""
-
-    # Gemini as chairman — better at nuanced synthesis
-    if schema:
-        return _gemini_structured(merge_system, merge_user, schema, temperature=0.3)
-    return _gemini(merge_system, merge_user, temperature=0.3)
-
-
-# ─────────────────────────────────────────────
 # CONTEXT BUILDER
 # ─────────────────────────────────────────────
 
 def _build_context(intelligence: dict, trends: dict) -> str:
-    """Builds a rich combined context string from all scraped data.
-    
-    The context is niche-agnostic — the LLM will infer the domain,
-    audience, and competitive landscape from the data itself.
-    """
     brand_uname = next(
-        (u for u, d in intelligence.items() if d.get("is_brand")),
-        None,
+        (u for u, d in intelligence.items() if d.get("is_brand")), None
     )
     if not brand_uname:
         raise ValueError("No brand account found in intelligence data (no is_brand=True).")
 
-    brand = intelligence[brand_uname]
+    brand       = intelligence[brand_uname]
     competitors = {u: d for u, d in intelligence.items() if not d.get("is_brand")}
 
-    # Brand section
     bp = brand["profile"]
     ba = brand["analytics"]
-    brand_captions = [
-        p["caption"][:120] for p in brand["posts"] if p.get("caption")
-    ][:5]
+    brand_captions = [p["caption"][:120] for p in brand["posts"] if p.get("caption")][:5]
 
-    # Competitor section
     comp_blocks = []
     for uname, data in competitors.items():
         a = data["analytics"]
         pinned_caption = next(
-            (p["caption"][:100] for p in data["posts"] if p.get("is_pinned")),
-            "None",
+            (p["caption"][:100] for p in data["posts"] if p.get("is_pinned")), "None"
         )
         comp_blocks.append(f"""
   @{uname}
@@ -232,18 +153,13 @@ def _build_context(intelligence: dict, trends: dict) -> str:
   Pinned Post  : {pinned_caption}
 """)
 
-    # SERP trend signals
     trend_snippets = []
     for query, results in trends.get("serp_results", {}).items():
         for r in results[:2]:
             if r.get("snippet"):
-                trend_snippets.append(
-                    f"  [{query[:60]}]\n  → {r['snippet'][:150]}"
-                )
+                trend_snippets.append(f"  [{query[:60]}]\n  → {r['snippet'][:150]}")
 
-    today = datetime.now().strftime("%B %Y")
-
-    context = f"""
+    return f"""
 ╔══════════════════════════════════════╗
 ║      BRAND UNDER ANALYSIS            ║
 ╚══════════════════════════════════════╝
@@ -268,160 +184,196 @@ Recent Captions:
 {chr(10).join(trend_snippets[:10])}
 
 Search queries used:
-{chr(10).join(f'  - {q}' for q in trends.get('gemini_queries', []))}
+{chr(10).join(f'  - {q}' for q in trends.get('search_queries', []))}
 
-Analysis Date: {today}
+Analysis Date: {datetime.now().strftime("%B %Y")}
 """.strip()
 
-    return context
-
 
 # ─────────────────────────────────────────────
-# LAYER 1: GAP ANALYSIS (Council)
+# PHASE 1 — LAYER WORKERS (6 independent functions)
+# Each returns a raw string (JSON or text).
+# All 6 fire simultaneously in run_analysis().
 # ─────────────────────────────────────────────
 
-def analyze_gaps(context: str, brand_username: str) -> GapAnalysis:
-    """Council decides: where is the brand strong, where is it weak?
-    
-    Prompts are data-driven — the LLM infers the niche, audience,
-    and competitive landscape entirely from the context.
-    """
-    logger.info("Layer 1: Gap Analysis [Council Mode]")
-
+def _layer1_gap_gpt(context: str, brand_username: str) -> str:
     system = """You are a senior social media strategist and competitive analyst.
-You are given detailed Instagram profile data, post analytics, and market trend signals
-for a brand and its competitors.
+Infer the brand's niche, target audience, and market positioning from the data.
+Analyze strengths, weaknesses, competitive gaps, and market opportunities.
+Every insight MUST reference specific data points — no generic advice."""
 
-Your job:
-1. INFER the brand's niche, target audience, and market positioning from the data
-2. Analyze strengths, weaknesses, and competitive gaps
-3. Identify market opportunities from the trend signals
-4. Every insight MUST be tied directly to specific data points — no generic advice
-
-Think step by step:
-- What industry/niche is this brand in? (infer from bio, hashtags, captions, content mix)
-- Who is the target audience? (infer from content style, engagement patterns)
-- Where does the brand outperform competitors? Where does it fall short?
-- What trending opportunities can the brand capitalize on?"""
-
-    user = f"""Analyze this competitive intelligence data for @{brand_username}:
+    user = f"""Analyze competitive intelligence for @{brand_username}:
 
 {context}
 
-Return a JSON object with this structure:
-- overall_score: brand_rating (1-10), vs_competitors (summary)
-- strengths: list of {{area, evidence, score}}
-- weaknesses: list of {{area, evidence, impact}}
-- competitor_advantages: list of {{competitor, advantage, how_to_counter}}
-- quick_wins: list of {{action, expected_impact, effort}}
-- market_opportunities: list of {{opportunity, trend_signal, urgency}}"""
+Return JSON:
+- overall_score: {{brand_rating (1-10), vs_competitors}}
+- strengths: [{{area, evidence, score}}]
+- weaknesses: [{{area, evidence, impact}}]
+- competitor_advantages: [{{competitor, advantage, how_to_counter}}]
+- quick_wins: [{{action, expected_impact, effort}}]
+- market_opportunities: [{{opportunity, trend_signal, urgency}}]"""
 
-    raw = _council(system, user, schema=GapAnalysis, temperature=0.4)
-    return _parse_and_validate(raw, GapAnalysis)
+    return _gpt(system, user, temperature=0.4)
 
 
-# ─────────────────────────────────────────────
-# LAYER 2: POST PROMPTS (Council)
-# ─────────────────────────────────────────────
+def _layer1_gap_sonnet(context: str, brand_username: str) -> str:
+    system = """You are a senior social media strategist and competitive analyst.
+Infer the brand's niche, target audience, and market positioning from the data.
+Analyze strengths, weaknesses, competitive gaps, and market opportunities.
+Every insight MUST reference specific data points — no generic advice."""
 
-def generate_post_prompts(
-    context: str,
-    gap_analysis: GapAnalysis,
-    brand_username: str,
-) -> PostPromptList:
-    """Council generates 5 ready-to-shoot content briefs.
-    Each targets a specific gap or opportunity.
-    
-    The LLM infers the right tone, aesthetics, cultural context,
-    and audience from the data — no hardcoded niche assumptions.
-    """
-    logger.info("Layer 2: Post Prompts [Council Mode]")
+    user = f"""Analyze competitive intelligence for @{brand_username}:
 
-    gaps_summary = json.dumps({
-        "weaknesses":           [w.model_dump() for w in gap_analysis.weaknesses],
-        "market_opportunities": [m.model_dump() for m in gap_analysis.market_opportunities],
-        "quick_wins":           [q.model_dump() for q in gap_analysis.quick_wins],
-    }, indent=2)
+{context}
 
+Return JSON:
+- overall_score: {{brand_rating (1-10), vs_competitors}}
+- strengths: [{{area, evidence, score}}]
+- weaknesses: [{{area, evidence, impact}}]
+- competitor_advantages: [{{competitor, advantage, how_to_counter}}]
+- quick_wins: [{{action, expected_impact, effort}}]
+- market_opportunities: [{{opportunity, trend_signal, urgency}}]"""
+
+    return _sonnet(system, user, temperature=0.4)
+
+
+def _layer2_posts_gpt(context: str, brand_username: str) -> str:
     system = """You are a creative director specializing in Instagram content strategy.
-You are given competitive intelligence data and a gap analysis for a brand.
-
-Your job:
-1. INFER the brand's niche, visual style, and target audience from the data
-2. Create content briefs that are culturally relevant to the brand's market
-3. Each brief must target a SPECIFIC gap or opportunity from the analysis
-4. Briefs must be immediately actionable — a creator should be able to shoot from them
-5. Every recommendation must be better than what competitors are currently doing
-
-Think about:
-- What content format works best for this niche? (Reels, Carousels, Static)
-- What visual aesthetics match the brand's positioning?
-- What posting times optimize for this audience's timezone and behavior?
-- What hooks will stop the scroll for THIS specific audience?"""
+Infer the brand's niche, visual style, and target audience from the data.
+Create 5 content briefs targeting gaps or opportunities — immediately actionable."""
 
     user = f"""Create 5 Instagram post prompts for @{brand_username}.
 
-COMPETITIVE INTELLIGENCE:
 {context}
 
-GAP ANALYSIS:
-{gaps_summary}
-
-For each post, provide:
+Return JSON with "posts" array. Each post:
 - post_number, gap_addressed, format (Reel/Carousel/Static Image)
-- hook (scroll-stopping opener), concept (full visual direction)
-- caption (ready to post with emojis), hashtags (list)
-- call_to_action, posting_time, why_this_wins
+- hook, concept, caption (with emojis), hashtags (list)
+- call_to_action, posting_time, why_this_wins"""
 
-Return as a JSON object with a "posts" key containing an array of 5 post objects."""
-
-    raw = _council(system, user, schema=PostPromptList, temperature=0.85)
-    return _parse_and_validate(raw, PostPromptList)
+    return _gpt(system, user, temperature=0.85)
 
 
-# ─────────────────────────────────────────────
-# LAYER 3: STRATEGY REPORT (GPT-OSS-12B — summarizing)
-# ─────────────────────────────────────────────
+def _layer2_posts_sonnet(context: str, brand_username: str) -> str:
+    system = """You are a creative director specializing in Instagram content strategy.
+Infer the brand's niche, visual style, and target audience from the data.
+Create 5 content briefs targeting gaps or opportunities — immediately actionable."""
 
-def generate_strategy_report(
-    context: str,
-    gap_analysis: GapAnalysis,
-    brand_username: str,
-) -> str:
-    """One-page strategic brief for the founder.
-    
-    Single GPT-OSS-12B call — council is overkill for summarization.
-    The LLM infers the niche and tailors the brief accordingly.
-    """
-    logger.info("Layer 3: Strategy Report [GPT-OSS-12B]")
+    user = f"""Create 5 Instagram post prompts for @{brand_username}.
 
+{context}
+
+Return JSON with "posts" array. Each post:
+- post_number, gap_addressed, format (Reel/Carousel/Static Image)
+- hook, concept, caption (with emojis), hashtags (list)
+- call_to_action, posting_time, why_this_wins"""
+
+    return _sonnet(system, user, temperature=0.85)
+
+
+def _layer3_report_gpt(context: str, brand_username: str) -> str:
     system = """You are a brand consultant writing a concise strategic brief.
-Analyze the data to understand the brand's industry, market, and competitive position.
-Write in clear, direct language. Every sentence must be actionable or insightful. No fluff.
-Tailor your advice to the specific niche and audience you observe in the data."""
+Write in clear, direct language. Every sentence must be actionable or insightful. No fluff."""
 
-    user = f"""Write a concise strategic brief (max 500 words) for @{brand_username}.
+    user = f"""Write a strategic brief (max 500 words) for @{brand_username}.
 
-KEY GAPS:
-{json.dumps([w.model_dump() for w in gap_analysis.weaknesses], indent=2)}
+{context}
 
-KEY OPPORTUNITIES:
-{json.dumps([m.model_dump() for m in gap_analysis.market_opportunities], indent=2)}
-
-QUICK WINS:
-{json.dumps([q.model_dump() for q in gap_analysis.quick_wins], indent=2)}
-
-OVERALL SCORE:
-{gap_analysis.overall_score.model_dump()}
-
-Structure exactly as:
-1. EXECUTIVE SUMMARY (2-3 sentences: current state, biggest gap, biggest opportunity)
+Structure:
+1. EXECUTIVE SUMMARY (2-3 sentences)
 2. WHERE YOU STAND VS COMPETITORS
-3. TOP 3 THINGS TO FIX IMMEDIATELY (with specific action for each)
-4. TOP 3 THINGS TO DOUBLE DOWN ON (what's already working)
-5. 30-DAY ACTION PLAN (week-by-week breakdown)"""
+3. TOP 3 THINGS TO FIX IMMEDIATELY
+4. TOP 3 THINGS TO DOUBLE DOWN ON
+5. 30-DAY ACTION PLAN (week-by-week)"""
 
     return _gpt_text(system, user, temperature=0.5)
+
+
+def _layer3_report_sonnet(context: str, brand_username: str) -> str:
+    system = """You are a brand consultant writing a concise strategic brief.
+Write in clear, direct language. Every sentence must be actionable or insightful. No fluff."""
+
+    user = f"""Write a strategic brief (max 500 words) for @{brand_username}.
+
+{context}
+
+Structure:
+1. EXECUTIVE SUMMARY (2-3 sentences)
+2. WHERE YOU STAND VS COMPETITORS
+3. TOP 3 THINGS TO FIX IMMEDIATELY
+4. TOP 3 THINGS TO DOUBLE DOWN ON
+5. 30-DAY ACTION PLAN (week-by-week)"""
+
+    return _sonnet_text(system, user, temperature=0.5)
+
+
+# ─────────────────────────────────────────────
+# PHASE 2 — OPUS CHAIRMAN SYNTHESIS
+# ─────────────────────────────────────────────
+
+def _opus_synthesize(
+    brand_username: str,
+    gap_gpt: str,
+    gap_sonnet: str,
+    posts_gpt: str,
+    posts_sonnet: str,
+    report_gpt: str,
+    report_sonnet: str,
+) -> MasterReport:
+    """Single Opus call — synthesizes all 6 Phase 1 outputs into one MasterReport."""
+    logger.info("Phase 2: Opus chairman synthesizing all outputs...")
+
+    schema_json = json.dumps(MasterReport.model_json_schema(), indent=2)
+
+    system = f"""You are the Chairman of an expert LLM Council reviewing all analysis for @{brand_username}.
+Six independent AI outputs are provided across three layers: gap analysis, post prompts, and strategy report.
+Your job: synthesize ONE definitive master report that is sharper and more actionable than any single input.
+
+Rules:
+- Where models agree → include with high confidence
+- Where models disagree → pick the more specific, evidence-backed position
+- Eliminate all redundancy — the master report must be tighter than its inputs
+- Every recommendation must be tied to a specific data point
+- Return ONLY valid JSON matching this schema:
+{schema_json}
+
+CRITICAL TOKEN INSTRUCTION:
+Because you are generating a massive JSON payload (analysis + 5 posts + strategy report), you risk hitting your output token limit. 
+To prevent JSON truncation, you MUST:
+1. Be extremely purely concise — use tight, punchy language.
+2. Limit `strategy_report` to max 250 words total.
+3. Keep `councilor_notes` under 3 sentences.
+4. Eliminate all fluff."""
+
+    user = f"""Synthesize these six outputs into ONE master report for @{brand_username}.
+
+=== GAP ANALYSIS — GPT-OSS (data-driven) ===
+{gap_gpt}
+
+=== GAP ANALYSIS — Claude Sonnet (nuanced) ===
+{gap_sonnet}
+
+=== POST PROMPTS — GPT-OSS (data-driven) ===
+{posts_gpt}
+
+=== POST PROMPTS — Claude Sonnet (creative) ===
+{posts_sonnet}
+
+=== STRATEGY REPORT — GPT-OSS ===
+{report_gpt}
+
+=== STRATEGY REPORT — Claude Sonnet ===
+{report_sonnet}"""
+
+    raw = anthropic_client.messages.create(
+        model=COUNCILOR,
+        max_tokens=8192,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+    ).content[0].text.strip()
+
+    return _parse_and_validate(raw, MasterReport)
 
 
 # ─────────────────────────────────────────────
@@ -429,27 +381,79 @@ Structure exactly as:
 # ─────────────────────────────────────────────
 
 def run_analysis(intelligence: dict, trends: dict) -> dict:
-    """Full 3-layer analysis pipeline:
-    Layer 1 → Gap Analysis        (LLM Council)
-    Layer 2 → Post Prompts        (LLM Council)
-    Layer 3 → Strategy Report     (GPT-OSS-12B)
+    """Two-phase pipeline:
+
+    Phase 1 — 6 workers fire simultaneously (max_workers=6):
+        L1: gap_gpt,    gap_sonnet
+        L2: posts_gpt,  posts_sonnet
+        L3: report_gpt, report_sonnet
+
+    Phase 2 — 1 Opus call synthesizes all 6 into MasterReport.
+
+    Wall time = max(Phase 1 slowest worker) + Opus call
     """
-    logger.info("Starting full analysis pipeline...")
+    logger.info("Starting optimized 2-phase pipeline...")
 
     brand_username = next(
-        (u for u, d in intelligence.items() if d.get("is_brand")),
-        None,
+        (u for u, d in intelligence.items() if d.get("is_brand")), None
     )
     if not brand_username:
         raise ValueError("No brand account found in intelligence data.")
 
     context = _build_context(intelligence, trends)
-    gap_analysis = analyze_gaps(context, brand_username)
-    post_prompts = generate_post_prompts(context, gap_analysis, brand_username)
-    strategy_report = generate_strategy_report(context, gap_analysis, brand_username)
 
-    return {
-        "gap_analysis":     gap_analysis.model_dump(),
-        "post_prompts":     post_prompts.model_dump(),
-        "strategy_report":  strategy_report,
+    # ── Phase 1: all 6 workers in parallel ──────────────────────────────────
+    logger.info("Phase 1: Firing all 6 layer workers in parallel...")
+
+    tasks = {
+        "gap_gpt":       lambda: _layer1_gap_gpt(context, brand_username),
+        "gap_sonnet":    lambda: _layer1_gap_sonnet(context, brand_username),
+        "posts_gpt":     lambda: _layer2_posts_gpt(context, brand_username),
+        "posts_sonnet":  lambda: _layer2_posts_sonnet(context, brand_username),
+        "report_gpt":    lambda: _layer3_report_gpt(context, brand_username),
+        "report_sonnet": lambda: _layer3_report_sonnet(context, brand_username),
     }
+
+    results: dict[str, str] = {}
+    errors:  dict[str, str] = {}
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(fn): name for name, fn in tasks.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+                logger.info(f"  [Phase 1] {name} — done")
+            except Exception as exc:
+                errors[name] = str(exc)
+                logger.warning(f"  [Phase 1] {name} — FAILED: {exc}")
+
+    # Graceful fallback: if one model in a pair failed, use the other for both
+    pairs = [
+        ("gap_gpt",    "gap_sonnet"),
+        ("posts_gpt",  "posts_sonnet"),
+        ("report_gpt", "report_sonnet"),
+    ]
+    for a, b in pairs:
+        if a not in results and b not in results:
+            raise RuntimeError(f"Both workers failed for pair ({a}, {b}) — cannot proceed.")
+        if a not in results:
+            logger.warning(f"  Fallback: duplicating {b} → {a}")
+            results[a] = results[b]
+        if b not in results:
+            logger.warning(f"  Fallback: duplicating {a} → {b}")
+            results[b] = results[a]
+
+    # ── Phase 2: single Opus synthesis ──────────────────────────────────────
+    master = _opus_synthesize(
+        brand_username,
+        gap_gpt=results["gap_gpt"],
+        gap_sonnet=results["gap_sonnet"],
+        posts_gpt=results["posts_gpt"],
+        posts_sonnet=results["posts_sonnet"],
+        report_gpt=results["report_gpt"],
+        report_sonnet=results["report_sonnet"],
+    )
+
+    logger.info("Pipeline complete.")
+    return master.model_dump()
