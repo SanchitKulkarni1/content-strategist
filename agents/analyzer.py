@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -26,6 +27,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
 
 from agents.schemas import GapAnalysis, PostPromptList, MasterReport
+from tools.cache import make_cache_key
 
 load_dotenv()
 
@@ -46,6 +48,10 @@ anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 GPT_MODEL      = "openai/gpt-oss-120b:free"
 ANALYSIS_AGENT = "claude-sonnet-4-6"   # Phase 1 worker — all 6 parallel calls
 COUNCILOR      = "claude-opus-4-7"     # Phase 2 chairman — single synthesis call
+LIGHT_COMBINER = "claude-3-5-sonnet"
+FORCE_OPUS = os.getenv("FORCE_OPUS", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+_REGEN_CACHE: dict[str, dict] = {}
 
 
 # ─────────────────────────────────────────────
@@ -103,7 +109,6 @@ def _sonnet_text(system: str, user: str, temperature: float = 0.7) -> str:
 
 def _parse_and_validate(raw: str, schema: type[BaseModel], retries: int = 2) -> BaseModel:
     """Parse raw JSON and validate against a Pydantic schema with retry."""
-    import re
     for attempt in range(retries + 1):
         try:
             cleaned = re.sub(r"```json\s*|```\s*", "", raw).strip()
@@ -123,71 +128,116 @@ def _parse_and_validate(raw: str, schema: type[BaseModel], retries: int = 2) -> 
 # CONTEXT BUILDER
 # ─────────────────────────────────────────────
 
-def _build_context(intelligence: dict, trends: dict) -> str:
-    brand_uname = next(
-        (u for u, d in intelligence.items() if d.get("is_brand")), None
-    )
+def _top_items(values: list[str], limit: int = 6) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = value.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(value.strip())
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _extract_brand_and_competitors(intelligence: dict) -> tuple[str, dict, dict[str, dict]]:
+    brand_uname = next((u for u, d in intelligence.items() if d.get("is_brand")), None)
     if not brand_uname:
         raise ValueError("No brand account found in intelligence data (no is_brand=True).")
-
-    brand       = intelligence[brand_uname]
+    brand = intelligence[brand_uname]
     competitors = {u: d for u, d in intelligence.items() if not d.get("is_brand")}
+    return brand_uname, brand, competitors
 
-    bp = brand["profile"]
-    ba = brand["analytics"]
-    brand_captions = [p["caption"][:120] for p in brand["posts"] if p.get("caption")][:5]
 
-    comp_blocks = []
+def build_gap_context(intelligence: dict) -> str:
+    """Compact context for gap analysis: metrics and competitor deltas only."""
+    brand_uname, brand, competitors = _extract_brand_and_competitors(intelligence)
+    ba = brand.get("analytics", {})
+    bp = brand.get("profile", {})
+
+    lines = [
+        f"Brand @{brand_uname}",
+        f"followers={bp.get('followers', 'N/A')}",
+        f"avg_likes={ba.get('avg_likes', 0)} avg_comments={ba.get('avg_comments', 0)}",
+        f"content_mix={ba.get('content_type_mix', {})}",
+        f"top_hashtags={_top_items(ba.get('all_hashtags_used', []), 6)}",
+    ]
+
     for uname, data in competitors.items():
-        a = data["analytics"]
-        pinned_caption = next(
-            (p["caption"][:100] for p in data["posts"] if p.get("is_pinned")), "None"
+        ca = data.get("analytics", {})
+        cp = data.get("profile", {})
+        likes_delta = (ca.get("avg_likes") or 0) - (ba.get("avg_likes") or 0)
+        comments_delta = (ca.get("avg_comments") or 0) - (ba.get("avg_comments") or 0)
+        lines.extend(
+            [
+                f"Comp @{uname} followers={cp.get('followers', 'N/A')}",
+                f"delta_likes={likes_delta} delta_comments={comments_delta}",
+                f"comp_mix={ca.get('content_type_mix', {})}",
+                f"comp_top_hashtags={_top_items(ca.get('all_hashtags_used', []), 5)}",
+            ]
         )
-        comp_blocks.append(f"""
-  @{uname}
-  Followers    : {data['profile'].get('followers', 'N/A')}
-  Avg Likes    : {a.get('avg_likes')} | Avg Comments: {a.get('avg_comments')}
-  Content Mix  : {a.get('content_type_mix')}
-  Top Hashtags : {a.get('all_hashtags_used', [])[:8]}
-  Collabs      : {a.get('influencer_collabs', [])}
-  Pinned Post  : {pinned_caption}
-""")
 
-    trend_snippets = []
-    for query, results in trends.get("serp_results", {}).items():
-        for r in results[:2]:
-            if r.get("snippet"):
-                trend_snippets.append(f"  [{query[:60]}]\n  → {r['snippet'][:150]}")
+    return "\n".join(lines)
 
-    return f"""
-╔══════════════════════════════════════╗
-║      BRAND UNDER ANALYSIS            ║
-╚══════════════════════════════════════╝
-@{brand_uname}
-Followers    : {bp.get('followers', 'N/A')}
-Bio          : {bp.get('bio', 'N/A')}
-Avg Likes    : {ba.get('avg_likes')} | Avg Comments: {ba.get('avg_comments')}
-Content Mix  : {ba.get('content_type_mix')}
-Top Hashtags : {ba.get('all_hashtags_used', [])[:8]}
-Collabs      : {ba.get('influencer_collabs', [])}
-Recent Captions:
-{chr(10).join(f'  - {c}' for c in brand_captions)}
 
-╔══════════════════════════════════════╗
-║           COMPETITORS                ║
-╚══════════════════════════════════════╝
-{"".join(comp_blocks)}
+def build_post_context(intelligence: dict) -> str:
+    """Compact context for post generation: audience/style/opportunities."""
+    brand_uname, brand, competitors = _extract_brand_and_competitors(intelligence)
+    bp = brand.get("profile", {})
+    ba = brand.get("analytics", {})
 
-╔══════════════════════════════════════╗
-║       MARKET TREND SIGNALS           ║
-╚══════════════════════════════════════╝
-{chr(10).join(trend_snippets[:10])}
+    brand_tags = _top_items(ba.get("all_hashtags_used", []), 10)
+    competitor_tags: list[str] = []
+    competitor_mix: list[str] = []
+    for uname, data in competitors.items():
+        ca = data.get("analytics", {})
+        competitor_tags.extend(ca.get("all_hashtags_used", []))
+        competitor_mix.append(f"@{uname}:{ca.get('content_type_mix', {})}")
 
-Search queries used:
-{chr(10).join(f'  - {q}' for q in trends.get('search_queries', []))}
+    missed_tags = [t for t in _top_items(competitor_tags, 12) if t.lower() not in {x.lower() for x in brand_tags}][:6]
+    recent_captions = [p.get("caption", "")[:80] for p in brand.get("posts", []) if p.get("caption")][:3]
 
-Analysis Date: {datetime.now().strftime("%B %Y")}
-""".strip()
+    return "\n".join(
+        [
+            f"Brand @{brand_uname}",
+            f"bio={bp.get('bio', 'N/A')}",
+            f"followers={bp.get('followers', 'N/A')}",
+            f"brand_content_mix={ba.get('content_type_mix', {})}",
+            f"brand_collabs={_top_items(ba.get('influencer_collabs', []), 6)}",
+            f"brand_top_hashtags={brand_tags}",
+            f"competitor_content_mix={competitor_mix}",
+            f"top_missed_hashtags={missed_tags}",
+            f"recent_caption_style_samples={recent_captions}",
+        ]
+    )
+
+
+def build_strategy_context(intelligence: dict) -> str:
+    """Compact executive context for strategic reporting."""
+    brand_uname, brand, competitors = _extract_brand_and_competitors(intelligence)
+    ba = brand.get("analytics", {})
+    bp = brand.get("profile", {})
+
+    comp_rows: list[str] = []
+    for uname, data in competitors.items():
+        ca = data.get("analytics", {})
+        comp_rows.append(
+            f"@{uname}: followers={data.get('profile', {}).get('followers', 'N/A')}, "
+            f"avg_likes={ca.get('avg_likes', 0)}, avg_comments={ca.get('avg_comments', 0)}"
+        )
+
+    return "\n".join(
+        [
+            f"Date={datetime.now().strftime('%B %Y')}",
+            f"Brand @{brand_uname}",
+            f"followers={bp.get('followers', 'N/A')}",
+            f"avg_likes={ba.get('avg_likes', 0)} avg_comments={ba.get('avg_comments', 0)}",
+            f"content_mix={ba.get('content_type_mix', {})}",
+            f"competitors={comp_rows}",
+        ]
+    )
 
 
 def _extract_brand_username(intelligence: dict) -> str:
@@ -213,6 +263,64 @@ Post generation rules:
 - Hooks, concepts, captions, and hashtags should all reflect this trend.
 - If a post cannot map to the trend, replace it with a different idea that can.
 """.strip()
+
+
+def _tokenize_keywords(text: str) -> set[str]:
+    stop = {
+        "the", "and", "for", "with", "that", "this", "from", "are", "you", "your", "into", "have",
+        "about", "they", "their", "will", "can", "should", "must", "what", "when", "where", "more",
+        "less", "than", "over", "under", "brand", "competitor", "instagram", "report", "analysis",
+    }
+    words = set(re.findall(r"[a-zA-Z][a-zA-Z0-9_]{2,}", text.lower()))
+    return {w for w in words if w not in stop}
+
+
+def _agreement_score(gap_gpt: str, gap_sonnet: str, report_gpt: str, report_sonnet: str) -> float:
+    gap_terms = _tokenize_keywords(f"{gap_gpt}\n{gap_sonnet}")
+    report_terms = _tokenize_keywords(f"{report_gpt}\n{report_sonnet}")
+    if not gap_terms or not report_terms:
+        return 0.0
+    overlap = len(gap_terms & report_terms)
+    union = len(gap_terms | report_terms)
+    if union == 0:
+        return 0.0
+    return overlap / union
+
+
+def _lightweight_combine(
+    brand_username: str,
+    gap_gpt: str,
+    gap_sonnet: str,
+    posts_gpt: str,
+    posts_sonnet: str,
+    report_gpt: str,
+    report_sonnet: str,
+) -> MasterReport:
+    """Faster synthesis path when worker outputs are already aligned."""
+    system = f"""You are a synthesis editor for @{brand_username}.
+Merge aligned model outputs into one JSON object for this schema:
+{json.dumps(MasterReport.model_json_schema(), separators=(',', ':'))}
+
+Rules:
+- Keep recommendations specific and evidence-backed
+- Use only one final set of 5 post prompts
+- Keep strategy_report under 220 words
+- Return valid JSON only"""
+
+    user = f"""GAP GPT:\n{gap_gpt}\n\nGAP SONNET:\n{gap_sonnet}\n\nPOSTS GPT:\n{posts_gpt}\n\nPOSTS SONNET:\n{posts_sonnet}\n\nREPORT GPT:\n{report_gpt}\n\nREPORT SONNET:\n{report_sonnet}"""
+
+    raw = anthropic_client.messages.create(
+        model=LIGHT_COMBINER,
+        max_tokens=6144,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+    ).content[0].text.strip()
+    return _parse_and_validate(raw, MasterReport)
+
+
+def _intelligence_hash(intelligence: dict) -> str:
+    payload = json.dumps(intelligence, sort_keys=True, default=str, separators=(",", ":"))
+    return make_cache_key("intelligence_payload", payload)
 
 
 # ─────────────────────────────────────────────
@@ -421,18 +529,20 @@ def run_analysis(intelligence: dict, trends: dict) -> dict:
 
     brand_username = _extract_brand_username(intelligence)
 
-    context = _build_context(intelligence, trends)
+    gap_context = build_gap_context(intelligence)
+    post_context = build_post_context(intelligence)
+    strategy_context = build_strategy_context(intelligence)
 
     # ── Phase 1: all 6 workers in parallel ──────────────────────────────────
     logger.info("Phase 1: Firing all 6 layer workers in parallel...")
 
     tasks = {
-        "gap_gpt":       lambda: _layer1_gap_gpt(context, brand_username),
-        "gap_sonnet":    lambda: _layer1_gap_sonnet(context, brand_username),
-        "posts_gpt":     lambda: _layer2_posts_gpt(context, brand_username),
-        "posts_sonnet":  lambda: _layer2_posts_sonnet(context, brand_username),
-        "report_gpt":    lambda: _layer3_report_gpt(context, brand_username),
-        "report_sonnet": lambda: _layer3_report_sonnet(context, brand_username),
+        "gap_gpt":       lambda: _layer1_gap_gpt(gap_context, brand_username),
+        "gap_sonnet":    lambda: _layer1_gap_sonnet(gap_context, brand_username),
+        "posts_gpt":     lambda: _layer2_posts_gpt(post_context, brand_username),
+        "posts_sonnet":  lambda: _layer2_posts_sonnet(post_context, brand_username),
+        "report_gpt":    lambda: _layer3_report_gpt(strategy_context, brand_username),
+        "report_sonnet": lambda: _layer3_report_sonnet(strategy_context, brand_username),
     }
 
     results: dict[str, str] = {}
@@ -465,16 +575,47 @@ def run_analysis(intelligence: dict, trends: dict) -> dict:
             logger.warning(f"  Fallback: duplicating {a} → {b}")
             results[b] = results[a]
 
-    # ── Phase 2: single Opus synthesis ──────────────────────────────────────
-    master = _opus_synthesize(
-        brand_username,
-        gap_gpt=results["gap_gpt"],
-        gap_sonnet=results["gap_sonnet"],
-        posts_gpt=results["posts_gpt"],
-        posts_sonnet=results["posts_sonnet"],
-        report_gpt=results["report_gpt"],
-        report_sonnet=results["report_sonnet"],
+    agreement = _agreement_score(
+        results["gap_gpt"],
+        results["gap_sonnet"],
+        results["report_gpt"],
+        results["report_sonnet"],
     )
+    logger.info("Agreement score between gap/report tracks: %.3f", agreement)
+
+    if FORCE_OPUS:
+        logger.info("FORCE_OPUS enabled: using Opus synthesis.")
+        master = _opus_synthesize(
+            brand_username,
+            gap_gpt=results["gap_gpt"],
+            gap_sonnet=results["gap_sonnet"],
+            posts_gpt=results["posts_gpt"],
+            posts_sonnet=results["posts_sonnet"],
+            report_gpt=results["report_gpt"],
+            report_sonnet=results["report_sonnet"],
+        )
+    elif agreement >= 0.3:
+        logger.info("Agreement high enough (>=0.3): using lightweight combiner.")
+        master = _lightweight_combine(
+            brand_username,
+            gap_gpt=results["gap_gpt"],
+            gap_sonnet=results["gap_sonnet"],
+            posts_gpt=results["posts_gpt"],
+            posts_sonnet=results["posts_sonnet"],
+            report_gpt=results["report_gpt"],
+            report_sonnet=results["report_sonnet"],
+        )
+    else:
+        logger.info("Agreement below threshold (<0.3): escalating to Opus synthesis.")
+        master = _opus_synthesize(
+            brand_username,
+            gap_gpt=results["gap_gpt"],
+            gap_sonnet=results["gap_sonnet"],
+            posts_gpt=results["posts_gpt"],
+            posts_sonnet=results["posts_sonnet"],
+            report_gpt=results["report_gpt"],
+            report_sonnet=results["report_sonnet"],
+        )
 
     logger.info("Pipeline complete.")
     return master.model_dump()
@@ -487,7 +628,22 @@ def regenerate_post_prompts(intelligence: dict, trends: dict, selected_trend: st
 
     trend_label = selected_trend.strip()
     brand_username = _extract_brand_username(intelligence)
-    context = _build_context(intelligence, trends)
+    competitor_usernames = sorted([u for u, d in intelligence.items() if not d.get("is_brand")])
+    intelligence_hash = _intelligence_hash(intelligence)
+    regen_cache_key = make_cache_key(
+        "regen_posts",
+        brand_username,
+        frozenset(competitor_usernames),
+        trend_label,
+        intelligence_hash,
+    )
+    cached = _REGEN_CACHE.get(regen_cache_key)
+    if cached is not None:
+        print(f"[CACHE] regenerate_post_prompts HIT trend='{trend_label}'")
+        return cached
+
+    print(f"[CACHE] regenerate_post_prompts MISS trend='{trend_label}'")
+    context = build_post_context(intelligence)
     context = f"{context}\n\n{_selected_trend_context(trend_label)}"
 
     logger.info("Regenerating post prompts for trend: %s", trend_label)
@@ -499,4 +655,5 @@ def regenerate_post_prompts(intelligence: dict, trends: dict, selected_trend: st
         "selected_trend": trend_label,
         "regenerated_at": datetime.now().isoformat(),
     }
+    _REGEN_CACHE[regen_cache_key] = payload
     return payload

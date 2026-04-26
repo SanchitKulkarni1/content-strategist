@@ -4,7 +4,7 @@ Each node function takes ContentStrategyState and returns a partial
 state dict. These are the functions imported by orchestrator/graph.py.
 
 Pipeline:
-  validate_input → scrape_instagram_data → fetch_market_trends →
+    validate_input → [scrape_instagram_data + plan_queries] → join_for_trends → fetch_market_trends →
   run_analysis → generate_recommendations → END
 """
 from __future__ import annotations
@@ -128,6 +128,31 @@ def scrape_instagram_data_node(state: dict[str, Any]) -> dict[str, Any]:
         return {"errors": state.get("errors", []) + [msg]}
 
 
+def plan_queries_node(state: dict[str, Any]) -> dict[str, Any]:
+    """Plan strategic search queries from validated usernames.
+
+    This node can run in parallel with scraping to shorten wall-clock time.
+    """
+    from agents.searchcalls import plan_queries_from_usernames
+
+    try:
+        queries = plan_queries_from_usernames(
+            state["primary_username"],
+            state.get("competitor_usernames", []),
+        )
+        logger.info("✓ Planned %d search queries.", len(queries))
+        return {"planned_search_queries": queries}
+    except Exception as exc:
+        msg = f"Query planning failed: {exc}"
+        logger.error(msg)
+        return {"errors": state.get("errors", []) + [msg]}
+
+
+def join_for_trends_node(state: dict[str, Any]) -> dict[str, Any]:
+    """No-op join node used to wait for scrape + plan branches."""
+    return {}
+
+
 # ─────────────────────────────────────────────
 # NODE 3: FETCH MARKET TRENDS (merged search + trends)
 # ─────────────────────────────────────────────
@@ -139,14 +164,18 @@ def fetch_market_trends_node(state: dict[str, Any]) -> dict[str, Any]:
     Claude Haiku infers the niche from the Apify data to generate
     targeted search queries.
     """
-    from agents.searchcalls import get_market_trends
+    from agents.searchcalls import get_market_trends, get_market_trends_with_planned_queries
 
     intelligence = state["apify_brand_intelligence"]
 
     logger.info("Fetching market trends (Claude Haiku → SERP → Google Trends)...")
 
     try:
-        trends = get_market_trends(intelligence)
+        planned = state.get("planned_search_queries", [])
+        if planned:
+            trends = get_market_trends_with_planned_queries(intelligence, planned)
+        else:
+            trends = get_market_trends(intelligence)
         logger.info(
             f"✓ Market trends fetched: {trends['_meta']['total_searches']} searches, "
             f"top hashtag: #{trends['_meta']['top_hashtag']}"

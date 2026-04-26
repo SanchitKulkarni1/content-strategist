@@ -18,6 +18,7 @@ dependencies = [
   "cerebras-cloud-sdk>=1.0.0",
   "pydantic>=2.0.0",
   "streamlit>=1.39.0",
+  "diskcache>=5.6.3",
 ]
 
 [tool.setuptools.packages.find]

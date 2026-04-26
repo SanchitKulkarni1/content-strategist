@@ -14,6 +14,8 @@ from langgraph.graph import END, START, StateGraph
 from agents import (
     fetch_market_trends_node,
     generate_recommendations_node,
+    join_for_trends_node,
+    plan_queries_node,
     run_analysis_node,
     scrape_instagram_data_node,
     validate_input_node,
@@ -28,6 +30,13 @@ def _route_on_errors(state: ContentStrategyState) -> str:
     return "continue"
 
 
+def _route_on_errors_parallel(state: ContentStrategyState) -> str:
+    """Same guard as _route_on_errors, named separately for parallel branching."""
+    if state.get("errors"):
+        return "end"
+    return "continue"
+
+
 def build_graph():
     """Build and compile the LangGraph workflow."""
     graph = StateGraph(ContentStrategyState)
@@ -35,6 +44,8 @@ def build_graph():
     # Register nodes
     graph.add_node("validate_input", validate_input_node)
     graph.add_node("scrape_instagram_data", scrape_instagram_data_node)
+    graph.add_node("plan_queries", plan_queries_node)
+    graph.add_node("join_for_trends", join_for_trends_node)
     graph.add_node("fetch_market_trends", fetch_market_trends_node)
     graph.add_node("run_analysis", run_analysis_node)
     graph.add_node("generate_recommendations", generate_recommendations_node)
@@ -48,7 +59,22 @@ def build_graph():
         {"continue": "scrape_instagram_data", "end": END},
     )
     graph.add_conditional_edges(
+        "validate_input",
+        _route_on_errors_parallel,
+        {"continue": "plan_queries", "end": END},
+    )
+    graph.add_conditional_edges(
         "scrape_instagram_data",
+        _route_on_errors,
+        {"continue": "join_for_trends", "end": END},
+    )
+    graph.add_conditional_edges(
+        "plan_queries",
+        _route_on_errors,
+        {"continue": "join_for_trends", "end": END},
+    )
+    graph.add_conditional_edges(
+        "join_for_trends",
         _route_on_errors,
         {"continue": "fetch_market_trends", "end": END},
     )

@@ -1,9 +1,12 @@
 import os
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from apify_client import ApifyClient
 from dotenv import load_dotenv
+
+from tools.cache import APIFY_TTL, cache_get, cache_set, make_cache_key
 
 load_dotenv()
 
@@ -122,9 +125,24 @@ def get_brand_intelligence(
     Ready to pass directly into LLM for analysis.
     """
     all_usernames = [brand_username] + competitor_usernames
+    date_bucket = datetime.now().strftime("%Y-%m-%d")
+    cache_key = make_cache_key(
+        "apify_brand_intelligence",
+        sorted(all_usernames),
+        date_bucket,
+    )
+    cached = cache_get(cache_key)
+    if cached is not None:
+        logger.info("Apify intelligence cache hit (%s)", date_bucket)
+        return cached
 
-    profiles = scrape_profiles(all_usernames)
-    posts    = scrape_posts(all_usernames, limit=posts_per_account)
+    logger.info("Apify intelligence cache miss (%s)", date_bucket)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        profiles_future = executor.submit(scrape_profiles, all_usernames)
+        posts_future = executor.submit(scrape_posts, all_usernames, posts_per_account)
+        profiles = profiles_future.result()
+        posts = posts_future.result()
 
     intelligence = {}
     for uname in all_usernames:
@@ -164,4 +182,5 @@ def get_brand_intelligence(
             }
         }
 
+    cache_set(cache_key, intelligence, APIFY_TTL)
     return intelligence

@@ -19,6 +19,7 @@ class ContentStrategyState(TypedDict, total=False):
 
     # ── Market trend outputs ────────────────────────────
     market_trends: dict[str, Any]
+    planned_search_queries: list[str]
     available_trends: list[str]
     selected_trend: str
 
