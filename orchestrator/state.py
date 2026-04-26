@@ -19,9 +19,13 @@ class ContentStrategyState(TypedDict, total=False):
 
     # ── Market trend outputs ────────────────────────────
     market_trends: dict[str, Any]
+    available_trends: list[str]
+    selected_trend: str
 
     # ── Analysis outputs ────────────────────────────────
     gap_analysis: dict[str, Any]
+    regenerated_post_prompts: dict[str, Any]
+    regeneration_error: str
 
     # ── Final output ────────────────────────────────────
     final_recommendations: dict[str, Any]

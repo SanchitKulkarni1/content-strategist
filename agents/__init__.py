@@ -16,6 +16,31 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _extract_available_trends(trends: dict[str, Any]) -> list[str]:
+    """Build a compact trend list for UI controls."""
+    discovered: list[str] = []
+
+    for query in trends.get("search_queries", [])[:8]:
+        cleaned = query.strip()
+        if cleaned:
+            discovered.append(cleaned)
+
+    top_hashtag = trends.get("_meta", {}).get("top_hashtag")
+    if top_hashtag:
+        discovered.insert(0, f"#{top_hashtag}")
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in discovered:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
 # ─────────────────────────────────────────────
 # NODE 1: VALIDATE INPUT
 # ─────────────────────────────────────────────
@@ -154,10 +179,13 @@ def run_analysis_node(state: dict[str, Any]) -> dict[str, Any]:
 
     try:
         results = run_analysis(intelligence, trends)
+        available_trends = _extract_available_trends(trends)
         logger.info("✓ Analysis pipeline complete.")
         return {
             "gap_analysis": results["gap_analysis"],
             "final_recommendations": results,
+            "available_trends": available_trends,
+            "selected_trend": available_trends[0] if available_trends else "",
         }
     except Exception as exc:
         msg = f"Analysis pipeline failed: {exc}"
@@ -184,9 +212,39 @@ def generate_recommendations_node(state: dict[str, Any]) -> dict[str, Any]:
         "brand": f"@{state.get('primary_username', 'unknown')}",
         "competitors": [f"@{u}" for u in state.get("competitor_usernames", [])],
         "market_signals_used": state.get("market_trends", {}).get("_meta", {}),
+        "active_trend": state.get("selected_trend", ""),
     }
 
     logger.info("✓ Final recommendations packaged.")
     return {
         "final_recommendations": recommendations,
     }
+
+
+def regenerate_post_prompts_node(state: dict[str, Any]) -> dict[str, Any]:
+    """Regenerate only post prompts from existing intelligence and trends."""
+    from agents.analyzer import regenerate_post_prompts
+
+    selected_trend = (state.get("selected_trend") or "").strip()
+    if not selected_trend:
+        return {"regeneration_error": "Please select or enter a trend first."}
+
+    try:
+        prompts = regenerate_post_prompts(
+            state["apify_brand_intelligence"],
+            state["market_trends"],
+            selected_trend,
+        )
+        recommendations = dict(state.get("final_recommendations", {}))
+        recommendations["post_prompts"] = prompts
+        recommendations.setdefault("_meta", {})
+        recommendations["_meta"]["active_trend"] = selected_trend
+        return {
+            "regenerated_post_prompts": prompts,
+            "final_recommendations": recommendations,
+            "regeneration_error": "",
+        }
+    except Exception as exc:
+        msg = f"Post regeneration failed: {exc}"
+        logger.error(msg)
+        return {"regeneration_error": msg}

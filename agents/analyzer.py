@@ -190,6 +190,31 @@ Analysis Date: {datetime.now().strftime("%B %Y")}
 """.strip()
 
 
+def _extract_brand_username(intelligence: dict) -> str:
+    """Return the brand username from intelligence payload."""
+    brand_username = next(
+        (u for u, d in intelligence.items() if d.get("is_brand")), None
+    )
+    if not brand_username:
+        raise ValueError("No brand account found in intelligence data.")
+    return brand_username
+
+
+def _selected_trend_context(selected_trend: str) -> str:
+    """Append hard constraints for trend-focused post generation."""
+    return f"""
+╔══════════════════════════════════════╗
+║      ACTIVE TREND CONSTRAINT         ║
+╚══════════════════════════════════════╝
+Selected trend: {selected_trend}
+
+Post generation rules:
+- Every post must directly align with the selected trend.
+- Hooks, concepts, captions, and hashtags should all reflect this trend.
+- If a post cannot map to the trend, replace it with a different idea that can.
+""".strip()
+
+
 # ─────────────────────────────────────────────
 # PHASE 1 — LAYER WORKERS (6 independent functions)
 # Each returns a raw string (JSON or text).
@@ -394,11 +419,7 @@ def run_analysis(intelligence: dict, trends: dict) -> dict:
     """
     logger.info("Starting optimized 2-phase pipeline...")
 
-    brand_username = next(
-        (u for u, d in intelligence.items() if d.get("is_brand")), None
-    )
-    if not brand_username:
-        raise ValueError("No brand account found in intelligence data.")
+    brand_username = _extract_brand_username(intelligence)
 
     context = _build_context(intelligence, trends)
 
@@ -457,3 +478,25 @@ def run_analysis(intelligence: dict, trends: dict) -> dict:
 
     logger.info("Pipeline complete.")
     return master.model_dump()
+
+
+def regenerate_post_prompts(intelligence: dict, trends: dict, selected_trend: str) -> dict:
+    """Regenerate only post prompts using a selected/custom trend."""
+    if not selected_trend or not selected_trend.strip():
+        raise ValueError("selected_trend is required for post regeneration.")
+
+    trend_label = selected_trend.strip()
+    brand_username = _extract_brand_username(intelligence)
+    context = _build_context(intelligence, trends)
+    context = f"{context}\n\n{_selected_trend_context(trend_label)}"
+
+    logger.info("Regenerating post prompts for trend: %s", trend_label)
+    # Keep regeneration path fast and deterministic: single Sonnet worker only.
+    sonnet_raw = _layer2_posts_sonnet(context, brand_username)
+    parsed = _parse_and_validate(sonnet_raw, PostPromptList)
+    payload = parsed.model_dump()
+    payload["_meta"] = {
+        "selected_trend": trend_label,
+        "regenerated_at": datetime.now().isoformat(),
+    }
+    return payload
