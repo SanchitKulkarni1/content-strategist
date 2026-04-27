@@ -1097,7 +1097,7 @@ if st.session_state.final_recommendations:
         )
         st.caption(
             "These notes explain how the AI council resolved disagreements "
-            "between GPT and Claude models to produce the final strategy."
+            "between GPT and Gemini models to produce the final strategy."
         )
 
         if isinstance(councilor_notes, dict):

@@ -51,23 +51,44 @@ def _extract_market_trends(result: dict[str, Any]) -> list[str]:
 
 def _extract_strategy_report(recommendations: dict[str, Any]) -> dict:
     report = recommendations.get("strategy_report", {})
+
+    def _empty() -> dict[str, Any]:
+        return {
+            "executiveSummary": "",
+            "top3Fixes": [],
+            "doubleDownOn": [],
+            "thirtyDayPlan": [],
+        }
+
+    def _to_list(value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(item) for item in value if str(item).strip()]
+        if isinstance(value, str) and value.strip():
+            return [value.strip()]
+        return []
+
     if isinstance(report, dict):
-        return report
+        return {
+            "executiveSummary": str(
+                report.get("executiveSummary")
+                or report.get("executive_summary")
+                or report.get("summary")
+                or ""
+            ),
+            "top3Fixes": _to_list(report.get("top3Fixes") or report.get("top_3_fixes")),
+            "doubleDownOn": _to_list(report.get("doubleDownOn") or report.get("double_down_on")),
+            "thirtyDayPlan": _to_list(report.get("thirtyDayPlan") or report.get("30_day_plan")),
+        }
 
     if isinstance(report, str):
         return {
-            "executive_summary": report,
-            "top_3_fixes": [],
-            "double_down_on": [],
-            "30_day_plan": [],
+            "executiveSummary": report,
+            "top3Fixes": [],
+            "doubleDownOn": [],
+            "thirtyDayPlan": [],
         }
 
-    return {
-        "executive_summary": "",
-        "top_3_fixes": [],
-        "double_down_on": [],
-        "30_day_plan": [],
-    }
+    return _empty()
 
 
 def _extract_councilor_notes(recommendations: dict[str, Any]) -> dict:

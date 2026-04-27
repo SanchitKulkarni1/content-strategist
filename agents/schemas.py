@@ -1,7 +1,7 @@
 """Pydantic schemas for structured LLM outputs.
 
-Used by both Anthropic Claude (prompt-based schema) and GPT-OSS-12B (json_schema)
-to enforce consistent, parseable responses from the LLM council.
+Used by both Gemini Flash (prompt-based schema) and GPT-OSS-12B (json_schema)
+to enforce consistent, parseable responses from the analysis pipeline.
 """
 from __future__ import annotations
 
@@ -101,14 +101,32 @@ class PostPromptList(BaseModel):
     )
 
 
+class StrategyReport(BaseModel):
+    executiveSummary: str = Field(
+        description="Executive summary in markdown-friendly plain text."
+    )
+    top3Fixes: list[str] = Field(
+        default_factory=list,
+        description="Top 3 immediate fixes as short actionable bullets."
+    )
+    doubleDownOn: list[str] = Field(
+        default_factory=list,
+        description="Top 3 strengths to amplify."
+    )
+    thirtyDayPlan: list[str] = Field(
+        default_factory=list,
+        description="Week-by-week 30-day action steps."
+    )
+
+
 # ─────────────────────────────────────────────
-# MASTER REPORT SCHEMA (Phase 2 Opus Synthesis)
+# MASTER REPORT SCHEMA (Final Output)
 # ─────────────────────────────────────────────
 
 class MasterReport(BaseModel):
     gap_analysis: GapAnalysis
     post_prompts: PostPromptList
-    strategy_report: str
+    strategy_report: StrategyReport
     councilor_notes: str = Field(
-        description="Opus's meta-commentary on where models disagreed and how the final strategy was synthesized."
+        description="Pipeline notes for model roles and trend selection context."
     )

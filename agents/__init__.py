@@ -20,6 +20,13 @@ def _extract_available_trends(trends: dict[str, Any]) -> list[str]:
     """Build a compact trend list for UI controls."""
     discovered: list[str] = []
 
+    major = trends.get("major_trends", [])
+    if isinstance(major, list):
+        for trend in major[:8]:
+            cleaned = str(trend).strip()
+            if cleaned:
+                discovered.append(cleaned)
+
     for query in trends.get("search_queries", [])[:8]:
         cleaned = query.strip()
         if cleaned:
@@ -158,17 +165,16 @@ def join_for_trends_node(state: dict[str, Any]) -> dict[str, Any]:
 # ─────────────────────────────────────────────
 
 def fetch_market_trends_node(state: dict[str, Any]) -> dict[str, Any]:
-    """Generate search queries (Claude Haiku) → execute SERP (parallel) → Google Trends.
+    """Generate search queries (GPT-OSS) → execute SERP → classify major trends.
     
     This is the merged search intelligence + market trends node.
-    Claude Haiku infers the niche from the Apify data to generate
-    targeted search queries.
+    GPT-OSS generates targeted SERP queries and Gemini tags major trends.
     """
     from agents.searchcalls import get_market_trends, get_market_trends_with_planned_queries
 
     intelligence = state["apify_brand_intelligence"]
 
-    logger.info("Fetching market trends (Claude Haiku → SERP → Google Trends)...")
+    logger.info("Fetching market trends (GPT-OSS → SERP → Gemini trend tags)...")
 
     try:
         planned = state.get("planned_search_queries", [])
@@ -190,21 +196,20 @@ def fetch_market_trends_node(state: dict[str, Any]) -> dict[str, Any]:
 
 
 # ─────────────────────────────────────────────
-# NODE 4: RUN ANALYSIS (LLM Council)
+# NODE 4: RUN ANALYSIS (MODEL SPLIT)
 # ─────────────────────────────────────────────
 
 def run_analysis_node(state: dict[str, Any]) -> dict[str, Any]:
-    """Run the 3-layer LLM analysis pipeline:
-    Layer 1 → Gap Analysis        (Council: GPT-OSS-12B + Claude Sonnet → Claude Opus chairman)
-    Layer 2 → Post Prompts        (Council)
-    Layer 3 → Strategy Report     (GPT-OSS-12B)
+    """Run simplified model split:
+    GPT-OSS handles gap analysis + strategic report.
+    Gemini handles trend-aware post prompts.
     """
     from agents.analyzer import run_analysis
 
     intelligence = state["apify_brand_intelligence"]
     trends = state["market_trends"]
 
-    logger.info("Running LLM Council analysis pipeline...")
+    logger.info("Running simplified GPT/Gemini analysis pipeline...")
 
     try:
         results = run_analysis(intelligence, trends)
