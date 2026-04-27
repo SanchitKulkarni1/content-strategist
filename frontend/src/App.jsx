@@ -22,6 +22,7 @@ export default function App() {
   const [linksLocked, setLinksLocked] = useState(false);
   const [activeTab, setActiveTab] = useState(0);
   const [activeTrend, setActiveTrend] = useState(null);
+  const [regeneratingTrend, setRegeneratingTrend] = useState(null);
   const [bannerDismissed, setBannerDismissed] = useState(false);
 
   const {
@@ -74,6 +75,7 @@ export default function App() {
     if (!trend) return;
 
     setActiveTrend(trend);
+    setRegeneratingTrend(trend);
     try {
       const response = await regenerate(brandUrl, competitorUrls, trend);
       setResults((prev) => {
@@ -82,6 +84,8 @@ export default function App() {
       });
     } catch {
       // Error is surfaced via hook state.
+    } finally {
+      setRegeneratingTrend(null);
     }
   };
 
@@ -114,6 +118,7 @@ export default function App() {
               onTrendSelect={setActiveTrend}
               onRegenerate={handleRegenerate}
               isRegenerating={isRegenerating}
+              regeneratingTrend={regeneratingTrend}
             />
           ) : null}
           {activeTab === 3 ? <CouncilorNotes data={results.councilor_notes} /> : null}

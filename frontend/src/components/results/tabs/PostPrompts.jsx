@@ -23,6 +23,7 @@ export default function PostPrompts({
   onTrendSelect,
   onRegenerate,
   isRegenerating,
+  regeneratingTrend,
 }) {
   const [customTrend, setCustomTrend] = useState("");
 
@@ -38,7 +39,11 @@ export default function PostPrompts({
               key={trend}
               trend={trend}
               active={activeTrend === trend}
-              onClick={onTrendSelect}
+              loading={Boolean(isRegenerating && activeTrend === trend && regeneratingTrend === trend)}
+              onClick={(selectedTrend) => {
+                onTrendSelect(selectedTrend);
+                onRegenerate(selectedTrend);
+              }}
             />
           ))}
         </div>
